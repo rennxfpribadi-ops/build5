@@ -1,11 +1,21 @@
 
-name: Build Flutter APK & AAB
+name: XF Server Flutter Build
 
 on:
   workflow_dispatch:
     inputs:
+      jobId:
+        description: "Build Job ID"
+        required: true
+        type: string
+
+      payload:
+        description: "JSON payload containing ZIP URL"
+        required: true
+        type: string
+
       build_type:
-        description: "Pilih hasil build"
+        description: "Build output"
         required: true
         type: choice
         options:
@@ -14,54 +24,81 @@ on:
           - aab
         default: both
 
+      perfMode:
+        description: "Build performance mode"
+        required: false
+        type: string
+        default: fast
+
+      engine:
+        description: "Build engine"
+        required: false
+        type: string
+        default: flutter
+
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   build:
-    name: Flutter Release Build
+    name: XF Flutter Build
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout Worker
         uses: actions/checkout@v4
 
-      # EKSTRAK BASE ZIP
-      - name: Extract Flutter Base ZIP
+      - name: Read Build Payload
+        id: payload
+        env:
+          PAYLOAD: ${{ inputs.payload }}
         run: |
-          BASE_ZIP="Kawan Kawan KesayanganKuh.zip"
+          URL=$(echo "$PAYLOAD" | jq -r '
+            if type == "object" then
+              (.zip_url // .download_url // .url // empty)
+            else empty end
+          ')
 
-          if [ ! -f "$BASE_ZIP" ]; then
-            echo "ERROR: File $BASE_ZIP tidak ditemukan!"
-            echo "File ZIP yang tersedia:"
-            find . -maxdepth 2 -name "*.zip"
+          if [ -z "$URL" ]; then
+            URL="$PAYLOAD"
+          fi
+
+          if [[ "$URL" != http://* && "$URL" != https://* ]]; then
+            echo "ERROR: ZIP URL tidak ditemukan dalam payload."
             exit 1
           fi
 
-          mkdir -p extracted
-          unzip -oq "$BASE_ZIP" -d extracted
+          echo "zip_url=$URL" >> "$GITHUB_OUTPUT"
 
-          PROJECT_DIR=$(find extracted -name pubspec.yaml -printf '%h\n' | head -n 1)
+      - name: Download Flutter Base
+        run: |
+          mkdir -p source
+          curl -fL --retry 3 \
+            "${{ steps.payload.outputs.zip_url }}" \
+            -o source/base.zip
+
+          unzip -oq source/base.zip -d source/extracted
+
+          PROJECT_DIR=$(find source/extracted \
+            -name pubspec.yaml -printf '%h\n' | head -n 1)
 
           if [ -z "$PROJECT_DIR" ]; then
-            echo "ERROR: pubspec.yaml tidak ditemukan dalam ZIP!"
+            echo "ERROR: pubspec.yaml tidak ditemukan!"
             exit 1
           fi
 
-          echo "Project ditemukan: $PROJECT_DIR"
+          mkdir -p project
+          cp -a "$PROJECT_DIR"/. project/
 
-          cp -a "$PROJECT_DIR"/. .
-
-          if [ ! -f pubspec.yaml ]; then
-            echo "ERROR: Ekstraksi project gagal!"
-            exit 1
-          fi
-
-          echo "Base Flutter berhasil diekstrak!"
+          test -f project/pubspec.yaml
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
 
       - name: Setup Flutter 3.38.0
         uses: subosito/flutter-action@v2
@@ -74,9 +111,11 @@ jobs:
         run: flutter doctor -v
 
       - name: Install Dependencies
+        working-directory: project
         run: flutter pub get
 
-      - name: Setup Android Keystore
+      - name: Setup Release Keystore
+        working-directory: project
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -86,7 +125,8 @@ jobs:
           test -n "$KEYSTORE_BASE64"
           mkdir -p android
 
-          echo "$KEYSTORE_BASE64" | base64 --decode > android/upload-keystore.jks
+          echo "$KEYSTORE_BASE64" | base64 --decode \
+            > android/upload-keystore.jks
 
           cat > android/key.properties <<EOF
           storePassword=$STORE_PASSWORD
@@ -97,22 +137,28 @@ jobs:
 
       - name: Build APK Release
         if: ${{ inputs.build_type == 'both' || inputs.build_type == 'apk' }}
+        working-directory: project
         run: flutter build apk --release
 
       - name: Build AAB Release
         if: ${{ inputs.build_type == 'both' || inputs.build_type == 'aab' }}
+        working-directory: project
         run: flutter build appbundle --release
 
-      - name: Upload APK
+      - name: Upload APK Artifact
         if: ${{ inputs.build_type == 'both' || inputs.build_type == 'apk' }}
         uses: actions/upload-artifact@v4
         with:
-          name: Flutter-Release-APK
-          path: build/app/outputs/flutter-apk/app-release.apk
+          name: apk-${{ inputs.jobId }}
+          path: project/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 3
 
-      - name: Upload AAB
+      - name: Upload AAB Artifact
         if: ${{ inputs.build_type == 'both' || inputs.build_type == 'aab' }}
         uses: actions/upload-artifact@v4
         with:
-          name: Flutter-Release-AAB
-          path: build/app/outputs/bundle/release/app-release.aab
+          name: aab-${{ inputs.jobId }}
+          path: project/build/app/outputs/bundle/release/app-release.aab
+          if-no-files-found: error
+          retention-days: 3
